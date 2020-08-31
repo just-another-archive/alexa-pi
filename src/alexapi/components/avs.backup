@@ -1,0 +1,372 @@
+import email
+import importlib
+import json
+import os
+import tempfile
+import time
+import sys
+import alsaaudio
+import requests
+import webrtcvad
+
+from pocketsphinx import get_model_path
+from pocketsphinx.pocketsphinx import Decoder
+
+from memcache import Client
+from transitions import Machine
+
+from player import Player
+from utils import check_network
+from utils import mrl_fix
+
+# constants
+VAD_SAMPLERATE       = 16000
+VAD_FRAME_MS         = 30
+VAD_PERIOD = (VAD_SAMPLERATE / 1000) * VAD_FRAME_MS
+
+VAD_THROWAWAY_FRAMES = 10
+VAD_SILENCE_TIMEOUT  = 1000
+
+MAX_RECORDING_LENGTH = 8
+
+SERVERS  = ["127.0.0.1:11211"]
+MEMCACHE = Client(SERVERS, debug=1)
+
+# some paths
+PATH = os.path.realpath(__file__).rstrip(os.path.basename(__file__))
+RES_PATH = os.path.join(PATH, '../resources', '')
+TMP_PATH = os.path.join(tempfile.mkdtemp(prefix='AlexaPi-runtime-'), '')
+
+class AVS(Machine):
+	def __init__(self, config):
+		Machine.__init__(self, initial='idle', states=states, transitions=transitions, ignore_invalid_triggers=True)
+
+		self.config  = config
+
+		self.pcm     = None
+		self.decoder = None
+
+		# populating player
+		handler = self.config['sound']['playback_handler']
+		imports = importlib.import_module('alexapi.playback_handlers.' + handler + "handler", package=None)
+		Handler = getattr(imports, handler.capitalize() + 'Handler')
+		handler = Handler(config)
+
+		self.player = Player(config, handler)
+
+		# populating associated platforms
+		self.platforms = []
+
+		for platform in config['platform']['device']:
+			imports = importlib.import_module('alexapi.device_platforms.' + platform, package=None)
+			Platform  = getattr(imports, platform.capitalize() + 'Platform')
+			self.platforms.append(Platform(config))
+
+		# linking state changes callbacks
+		self.on_enter_booting(self._enter_booting)
+		self.on_enter_greeting(self._enter_greeting)
+		self.on_enter_waiting(self._enter_waiting)
+		self.on_enter_capturing(self._enter_capturing)
+		self.on_enter_processing(self._enter_processing)
+		self.on_enter_fullfilling(self._enter_fullfilling)
+		self.on_enter_reporting(self._enter_reporting)
+		self.on_enter_cleaning(self._enter_cleaning)
+		self.on_exit_waiting(self._exit_waiting)
+
+
+
+	# nasty patch waiting for PR#170 to be merged
+	def _after_state_change(self, value):
+		if self.config and self.config['debug']:
+			print('[AVS] Entering {}'.format(value))
+
+		for platform in self.platforms:
+			platform.avs_state_change(value)
+
+
+
+	def _enter_booting(self):
+		self._after_state_change('booting')
+
+		sys.stdout.write("Trying to reach Amazon...")
+		while not check_network():
+			sys.stdout.write(".")
+
+		print("")
+		print("Connection OK")
+
+		if not self._get_token():
+			sys.exit()
+
+		self.greet()
+
+
+
+	def _enter_greeting(self):
+		self._after_state_change('greeting')
+
+		if not self.config['silent']:
+			self.player.play_speech(RES_PATH + "hello.mp3")
+
+		self.wait()
+
+
+
+	def _enter_waiting(self):
+		self._after_state_change('waiting')
+
+		# create Decoder on the fly
+		if not self.decoder:
+			config = Decoder.default_config()
+
+			# set recognition model to US
+			config.set_string('-hmm', os.path.join(get_model_path(), 'en-us'))
+			config.set_string('-dict', os.path.join(get_model_path(), 'cmudict-en-us.dict'))
+
+			# specify recognition key phrase
+			config.set_string('-keyphrase', self.config['sphinx']['trigger_phrase'])
+			config.set_float('-kws_threshold', 1e-5)
+
+			# hide the VERY verbose logging information
+			if not self.config['debug']:
+				config.set_string('-logfn', '/dev/null')
+
+			self.decoder = Decoder(config)
+
+		# start decoding
+		self.decoder.start_utt()
+
+		self.pcm = alsaaudio.PCM(alsaaudio.PCM_CAPTURE, alsaaudio.PCM_NORMAL, self.config['sound']['input_device'])
+		self.pcm.setchannels(1)
+		self.pcm.setrate(16000)
+		self.pcm.setformat(alsaaudio.PCM_FORMAT_S16_LE)
+		self.pcm.setperiodsize(1024)
+
+		triggered = False
+		while not triggered:
+			_, buffer = self.pcm.read()
+			self.decoder.process_raw(buffer, False, False)
+			triggered = self.decoder.hyp() is not None
+
+		self.capture()
+
+
+
+	def _exit_waiting(self):
+		if self.pcm != None:
+			self.pcm.close()
+			self.pcm = None
+			self.decoder.end_utt()
+
+
+
+	def _enter_capturing(self, vad_throwaway_frames=VAD_THROWAWAY_FRAMES, discreet=False):
+		self._after_state_change('capturing')
+
+		if not discreet:
+			self.player.play_speech(RES_PATH + 'alexayes.mp3')
+
+		audio = ""
+
+		pcm = alsaaudio.PCM(alsaaudio.PCM_CAPTURE, alsaaudio.PCM_NORMAL, self.config['sound']['input_device'])
+		pcm.setchannels(1)
+		pcm.setrate(VAD_SAMPLERATE)
+		pcm.setformat(alsaaudio.PCM_FORMAT_S16_LE)
+		pcm.setperiodsize(VAD_PERIOD)
+
+		vad = webrtcvad.Vad(2)
+
+		silenceRun = 0
+		numSilenceRuns = 0
+		thresholdSilenceMet = False
+
+		frames = 0
+		start = time.time()
+
+		# do not count first 10 frames when doing VAD
+		while frames < vad_throwaway_frames:
+			length, data = pcm.read()
+			frames = frames + 1
+			if length:
+				audio += data
+
+		# now do VAD
+		while ((thresholdSilenceMet is False) and ((time.time() - start) < MAX_RECORDING_LENGTH)):
+			length, data = pcm.read()
+			if length:
+				audio += data
+
+				if length == VAD_PERIOD:
+					isSpeech = vad.is_speech(data, VAD_SAMPLERATE)
+
+					if not isSpeech:
+						silenceRun = silenceRun + 1
+						# print "0"
+					else:
+						silenceRun = 0
+						numSilenceRuns = numSilenceRuns + 1
+						# print "1"
+
+			# only count silence runs after the first one
+			# (allow user to speak for total of max recording length if they haven't said anything yet)
+			if (numSilenceRuns != 0) and ((silenceRun * VAD_FRAME_MS) > VAD_SILENCE_TIMEOUT):
+				thresholdSilenceMet = True
+
+		with open(TMP_PATH + 'recording.wav', 'w') as rf:
+			rf.write(audio)
+
+		pcm.close()
+		self.process()
+
+
+
+	def _enter_processing(self):
+		self._after_state_change('processing')
+
+		url = 'https://access-alexa-na.amazon.com/v1/avs/speechrecognizer/recognize'
+		headers = {'Authorization': 'Bearer %s' % self._get_token()}
+		data = {
+			"messageHeader": {
+				"deviceContext": [
+					{
+						"name": "playbackState",
+						"namespace": "AudioPlayer",
+						"payload": {
+							"streamId": "",
+							"offsetInMilliseconds": "0",
+							"playerActivity": "IDLE"
+						}
+					}
+				]
+			},
+			"messageBody": {
+				"profile": "alexa-close-talk",
+				"locale": "en-us",
+				"format": "audio/L16; rate=16000; channels=1"
+			}
+		}
+
+		with open(TMP_PATH + 'recording.wav') as audio:
+			files = [
+				('file', ('request', json.dumps(data), 'application/json; charset=UTF-8')),
+				('file', ('audio', audio, 'audio/L16; rate=16000; channels=1'))
+			]
+			resp = requests.post(url, headers=headers, files=files)
+
+		# cleanup right after use
+		os.remove(TMP_PATH + 'recording.wav')
+
+		if resp.status_code == 200:
+			self.fullfill(response=resp)
+		elif resp.status_code == 204:
+			self.wait()
+		else:
+			self.report(response=resp)
+
+
+
+	def _enter_fullfilling(self, response):
+		self._after_state_change('fullfilling')
+
+		wrapper = "Content-Type: " + response.headers['content-type'] + '\r\n\r\n' + response.content
+		message = email.message_from_string(wrapper)
+		directives = None
+
+		for payload in message.get_payload():
+			content_type = payload.get_content_type()
+			data = payload.get_payload()
+
+			if content_type == "audio/mpeg":
+				filename = TMP_PATH + payload.get('Content-ID').strip("<>") + ".mp3"
+				with open(filename, 'wb') as audio:
+					audio.write(payload.get_payload())
+			else:
+				if content_type == "application/json":
+					directives = json.loads(data)
+					data = json.dumps(directives)
+
+				if self.config['debug']:
+					print('-- Unknown data returned:')
+					print(data)
+
+		# process audio items first
+		if 'audioItem' in directives['messageBody']:
+			self.player.play_playlist(j['messageBody'])
+			pass
+
+		# for lisibility
+		directives = directives['messageBody']['directives']
+
+		if not directives or len(directives) == 0 :
+			self.player.play_speech(RES_PATH + 'beep.wav')
+			self.wait()
+			return
+
+		for directive in directives:
+			# speaker control such as volume or mute
+			if directive['namespace'] == "Speaker":
+				if directive['name'] == 'SetVolume':
+					self.player.set_volume(int(directive['payload']['volume']), directive['payload']['adjustmentType'] == 'relative')
+
+				elif directive['name'] == 'SetMute':
+					# TODO
+					pass
+
+			# if need of a new capture phase
+			elif directive['namespace'] == 'SpeechRecognizer':
+				if directive['name'] == 'listen':
+					self.player.play_speech(RES_PATH + 'beep.wav')
+					self.capture(vad_throwaway_frames=directive['payload']['timeoutIntervalInMillis'] / 116, discreet=True)
+
+			# play speech
+			elif directive['namespace'] == 'SpeechSynthesizer':
+				if directive['name'] == 'speak':
+					self.player.play_speech(mrl_fix("file://" + TMP_PATH + directive['payload']['audioContent'].lstrip("cid:") + ".mp3"))
+
+			# play music
+			elif directive['namespace'] == 'AudioPlayer':
+				if directive['name'] == 'play':
+					self.player.play_playlist(directive['payload'])
+
+		time.sleep(1)
+		self.wait()
+
+
+
+	def _enter_reporting(self, response):
+		self._after_state_change('reporting')
+
+		self.player.play_speech(RES_PATH + 'beep.wav')
+		self.wait()
+
+
+
+	def _enter_cleaning(self):
+		self._after_state_change('cleaning')
+
+
+
+	def _get_token(self):
+		token = MEMCACHE.get("access_token")
+		refresh = self.config['alexa']['refresh_token']
+
+		if token:
+			return token
+
+		elif refresh:
+			url = "https://api.amazon.com/auth/o2/token"
+			payload = {
+				"client_id": self.config['alexa']['Client_ID'],
+				"client_secret": self.config['alexa']['Client_Secret'],
+				"refresh_token": refresh,
+				"grant_type": "refresh_token"
+			}
+
+			response = requests.post(url, data=payload)
+			resp = json.loads(response.text)
+
+			MEMCACHE.set("access_token", resp['access_token'], 3570)
+			return resp['access_token']
+
+		else:
+			return False
